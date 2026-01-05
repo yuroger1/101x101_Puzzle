@@ -1,190 +1,30 @@
+#include <errno.h>
+#include <limits.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <errno.h>
+#include <time.h>
 
 #define MAX_LINE 8192
-
-typedef struct Node {
-    int *state;
-    int blank_index;
-    int g;
-    int h;
-    struct Node *parent;
-    char move;
-} Node;
+#define MAX_ITERATION_BOUND 1000000
 
 typedef struct {
-    Node **data;
-    size_t size;
-    size_t capacity;
-} MinHeap;
+    int n;
+    int len;
+    long long expanded;
+} SearchContext;
 
-typedef struct VisitedEntry {
-    uint64_t hash;
-    int g;
-    int *state;
-    struct VisitedEntry *next;
-} VisitedEntry;
-
-typedef struct {
-    VisitedEntry **buckets;
-    size_t bucket_count;
-} VisitedSet;
-
-static uint64_t fnv1a_hash(const int *state, int len) {
-    uint64_t hash = 1469598103934665603ULL;
-    for (int i = 0; i < len; i++) {
-        uint64_t value = (uint64_t)(state[i] + 2);
-        hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
-        hash *= 1099511628211ULL;
-    }
-    return hash;
-}
-
-static bool states_equal(const int *a, const int *b, int len) {
-    return memcmp(a, b, sizeof(int) * (size_t)len) == 0;
-}
-
-static void heap_init(MinHeap *heap) {
-    heap->data = NULL;
-    heap->size = 0;
-    heap->capacity = 0;
-}
-
-static void heap_swap(Node **a, Node **b) {
-    Node *tmp = *a;
-    *a = *b;
-    *b = tmp;
-}
-
-static int node_priority(const Node *node) {
-    return node->g + node->h;
-}
-
-static void heap_push(MinHeap *heap, Node *node) {
-    if (heap->size == heap->capacity) {
-        size_t new_capacity = heap->capacity == 0 ? 64 : heap->capacity * 2;
-        Node **new_data = realloc(heap->data, new_capacity * sizeof(Node *));
-        if (!new_data) {
-            fprintf(stderr, "Failed to allocate heap.\n");
-            exit(EXIT_FAILURE);
-        }
-        heap->data = new_data;
-        heap->capacity = new_capacity;
-    }
-
-    heap->data[heap->size] = node;
-    size_t idx = heap->size;
-    heap->size++;
-
-    while (idx > 0) {
-        size_t parent = (idx - 1) / 2;
-        int cur_priority = node_priority(heap->data[idx]);
-        int parent_priority = node_priority(heap->data[parent]);
-        if (cur_priority < parent_priority ||
-            (cur_priority == parent_priority && heap->data[idx]->h < heap->data[parent]->h)) {
-            heap_swap(&heap->data[idx], &heap->data[parent]);
-            idx = parent;
-        } else {
-            break;
-        }
-    }
-}
-
-static Node *heap_pop(MinHeap *heap) {
-    if (heap->size == 0) {
-        return NULL;
-    }
-    Node *top = heap->data[0];
-    heap->size--;
-    if (heap->size > 0) {
-        heap->data[0] = heap->data[heap->size];
-        size_t idx = 0;
-        while (true) {
-            size_t left = idx * 2 + 1;
-            size_t right = idx * 2 + 2;
-            size_t smallest = idx;
-            if (left < heap->size) {
-                int left_priority = node_priority(heap->data[left]);
-                int smallest_priority = node_priority(heap->data[smallest]);
-                if (left_priority < smallest_priority ||
-                    (left_priority == smallest_priority &&
-                     heap->data[left]->h < heap->data[smallest]->h)) {
-                    smallest = left;
-                }
+static void print_state(const int *state, int n) {
+    for (int r = 0; r < n; r++) {
+        for (int c = 0; c < n; c++) {
+            if (c > 0) {
+                printf(",");
             }
-            if (right < heap->size) {
-                int right_priority = node_priority(heap->data[right]);
-                int smallest_priority = node_priority(heap->data[smallest]);
-                if (right_priority < smallest_priority ||
-                    (right_priority == smallest_priority &&
-                     heap->data[right]->h < heap->data[smallest]->h)) {
-                    smallest = right;
-                }
-            }
-            if (smallest != idx) {
-                heap_swap(&heap->data[idx], &heap->data[smallest]);
-                idx = smallest;
-            } else {
-                break;
-            }
+            printf("%d", state[r * n + c]);
         }
+        printf("\n");
     }
-    return top;
-}
-
-static void visited_init(VisitedSet *set, size_t bucket_count) {
-    set->bucket_count = bucket_count;
-    set->buckets = calloc(bucket_count, sizeof(VisitedEntry *));
-    if (!set->buckets) {
-        fprintf(stderr, "Failed to allocate visited set.\n");
-        exit(EXIT_FAILURE);
-    }
-}
-
-static bool visited_should_skip(VisitedSet *set, uint64_t hash, const int *state, int len, int g) {
-    size_t idx = hash % set->bucket_count;
-    VisitedEntry *entry = set->buckets[idx];
-    while (entry) {
-        if (entry->hash == hash && states_equal(entry->state, state, len)) {
-            if (g >= entry->g) {
-                return true;
-            }
-            entry->g = g;
-            return false;
-        }
-        entry = entry->next;
-    }
-    return false;
-}
-
-static void visited_add(VisitedSet *set, uint64_t hash, int *state, int len, int g) {
-    size_t idx = hash % set->bucket_count;
-    VisitedEntry *entry = malloc(sizeof(VisitedEntry));
-    if (!entry) {
-        fprintf(stderr, "Failed to allocate visited entry.\n");
-        exit(EXIT_FAILURE);
-    }
-    entry->hash = hash;
-    entry->g = g;
-    entry->state = state;
-    entry->next = set->buckets[idx];
-    set->buckets[idx] = entry;
-}
-
-static void visited_free(VisitedSet *set) {
-    for (size_t i = 0; i < set->bucket_count; i++) {
-        VisitedEntry *entry = set->buckets[i];
-        while (entry) {
-            VisitedEntry *next = entry->next;
-            free(entry);
-            entry = next;
-        }
-    }
-    free(set->buckets);
 }
 
 static int count_misplaced(const int *state, int len) {
@@ -224,17 +64,63 @@ static int manhattan_distance(const int *state, int n) {
     return distance;
 }
 
-static void print_state(const int *state, int n) {
-    for (int r = 0; r < n; r++) {
-        for (int c = 0; c < n; c++) {
-            int value = state[r * n + c];
-            if (c > 0) {
-                printf(",");
-            }
-            printf("%d", value);
+static bool is_goal(const int *state, int len) {
+    for (int i = 0; i < len - 1; i++) {
+        if (state[i] != i) {
+            return false;
         }
-        printf("\n");
     }
+    return state[len - 1] == -1;
+}
+
+static char opposite_move(char move) {
+    switch (move) {
+        case 'U':
+            return 'D';
+        case 'D':
+            return 'U';
+        case 'L':
+            return 'R';
+        case 'R':
+            return 'L';
+        default:
+            return '\0';
+    }
+}
+
+static bool apply_move(int *state, int n, int *blank_index, char move) {
+    int row = *blank_index / n;
+    int col = *blank_index % n;
+    int new_row = row;
+    int new_col = col;
+
+    switch (move) {
+        case 'U':
+            new_row--;
+            break;
+        case 'D':
+            new_row++;
+            break;
+        case 'L':
+            new_col--;
+            break;
+        case 'R':
+            new_col++;
+            break;
+        default:
+            return false;
+    }
+
+    if (new_row < 0 || new_row >= n || new_col < 0 || new_col >= n) {
+        return false;
+    }
+
+    int new_index = new_row * n + new_col;
+    int temp = state[new_index];
+    state[new_index] = -1;
+    state[*blank_index] = temp;
+    *blank_index = new_index;
+    return true;
 }
 
 static bool read_ini(const char *path, int **out_state, int *out_n, int *out_blank) {
@@ -356,120 +242,6 @@ static bool read_moves(const char *path, char **out_moves, size_t *out_count) {
     return true;
 }
 
-static bool apply_move(int *state, int n, int *blank_index, char move) {
-    int row = *blank_index / n;
-    int col = *blank_index % n;
-    int new_row = row;
-    int new_col = col;
-
-    switch (move) {
-        case 'U':
-            new_row--;
-            break;
-        case 'D':
-            new_row++;
-            break;
-        case 'L':
-            new_col--;
-            break;
-        case 'R':
-            new_col++;
-            break;
-        default:
-            return false;
-    }
-
-    if (new_row < 0 || new_row >= n || new_col < 0 || new_col >= n) {
-        return false;
-    }
-
-    int new_index = new_row * n + new_col;
-    int temp = state[new_index];
-    state[new_index] = -1;
-    state[*blank_index] = temp;
-    *blank_index = new_index;
-    return true;
-}
-
-static Node *create_node(const int *state, int len, int blank_index, int g, int h, Node *parent, char move) {
-    Node *node = malloc(sizeof(Node));
-    if (!node) {
-        fprintf(stderr, "Failed to allocate node.\n");
-        exit(EXIT_FAILURE);
-    }
-    node->state = malloc(sizeof(int) * (size_t)len);
-    if (!node->state) {
-        fprintf(stderr, "Failed to allocate node state.\n");
-        exit(EXIT_FAILURE);
-    }
-    memcpy(node->state, state, sizeof(int) * (size_t)len);
-    node->blank_index = blank_index;
-    node->g = g;
-    node->h = h;
-    node->parent = parent;
-    node->move = move;
-    return node;
-}
-
-typedef struct {
-    Node **items;
-    size_t size;
-    size_t capacity;
-} NodeList;
-
-static void node_list_init(NodeList *list) {
-    list->items = NULL;
-    list->size = 0;
-    list->capacity = 0;
-}
-
-static void node_list_push(NodeList *list, Node *node) {
-    if (list->size == list->capacity) {
-        size_t new_capacity = list->capacity == 0 ? 128 : list->capacity * 2;
-        Node **new_items = realloc(list->items, new_capacity * sizeof(Node *));
-        if (!new_items) {
-            fprintf(stderr, "Failed to allocate node list.\n");
-            exit(EXIT_FAILURE);
-        }
-        list->items = new_items;
-        list->capacity = new_capacity;
-    }
-    list->items[list->size++] = node;
-}
-
-static void node_list_free(NodeList *list) {
-    for (size_t i = 0; i < list->size; i++) {
-        free(list->items[i]->state);
-        free(list->items[i]);
-    }
-    free(list->items);
-}
-
-static char *reconstruct_moves(Node *goal_node, size_t *out_count) {
-    size_t capacity = (size_t)goal_node->g + 1;
-    char *moves = malloc(capacity);
-    if (!moves) {
-        fprintf(stderr, "Failed to allocate moves.\n");
-        exit(EXIT_FAILURE);
-    }
-
-    size_t idx = 0;
-    Node *current = goal_node;
-    while (current->parent) {
-        moves[idx++] = current->move;
-        current = current->parent;
-    }
-
-    for (size_t i = 0; i < idx / 2; i++) {
-        char temp = moves[i];
-        moves[i] = moves[idx - 1 - i];
-        moves[idx - 1 - i] = temp;
-    }
-
-    *out_count = idx;
-    return moves;
-}
-
 static void write_moves(const char *path, const char *moves, size_t count) {
     FILE *file = fopen(path, "w");
     if (!file) {
@@ -482,110 +254,207 @@ static void write_moves(const char *path, const char *moves, size_t count) {
     fclose(file);
 }
 
-static char opposite_move(char move) {
-    switch (move) {
-        case 'U':
-            return 'D';
-        case 'D':
-            return 'U';
-        case 'L':
-            return 'R';
-        case 'R':
-            return 'L';
-        default:
-            return '\0';
-    }
-}
-
-static bool is_goal(const int *state, int len) {
-    for (int i = 0; i < len - 1; i++) {
-        if (state[i] != i) {
-            return false;
+static int count_inversions(const int *state, int len) {
+    int inv = 0;
+    for (int i = 0; i < len; i++) {
+        if (state[i] == -1) {
+            continue;
+        }
+        for (int j = i + 1; j < len; j++) {
+            if (state[j] == -1) {
+                continue;
+            }
+            if (state[i] > state[j]) {
+                inv++;
+            }
         }
     }
-    return state[len - 1] == -1;
+    return inv;
 }
 
-static void solve_puzzle(const int *start_state, int n, int blank_index) {
+static bool is_solvable(const int *state, int n, int blank_index) {
     int len = n * n;
-    int start_h = manhattan_distance(start_state, n);
-    Node *start_node = create_node(start_state, len, blank_index, 0, start_h, NULL, '\0');
-    NodeList nodes;
-    node_list_init(&nodes);
-    node_list_push(&nodes, start_node);
+    int inversions = count_inversions(state, len);
+    if (n % 2 == 1) {
+        return (inversions % 2) == 0;
+    }
+    int blank_row_from_bottom = n - (blank_index / n);
+    if (blank_row_from_bottom % 2 == 0) {
+        return (inversions % 2) == 1;
+    }
+    return (inversions % 2) == 0;
+}
 
-    MinHeap open_set;
-    heap_init(&open_set);
-    heap_push(&open_set, start_node);
-
-    VisitedSet visited;
-    visited_init(&visited, 1048576);
-    visited_add(&visited, fnv1a_hash(start_state, len), start_node->state, len, 0);
-
-    Node *goal_node = NULL;
-    const char moves[4] = {'U', 'D', 'L', 'R'};
-
-    while (open_set.size > 0) {
-        Node *current = heap_pop(&open_set);
-        if (is_goal(current->state, len)) {
-            goal_node = current;
+static void make_solvable(int *state, int n, int *blank_index) {
+    if (is_solvable(state, n, *blank_index)) {
+        return;
+    }
+    int len = n * n;
+    int first = -1;
+    int second = -1;
+    for (int i = 0; i < len; i++) {
+        if (state[i] == -1) {
+            continue;
+        }
+        if (first == -1) {
+            first = i;
+        } else {
+            second = i;
             break;
         }
+    }
+    if (first != -1 && second != -1) {
+        int temp = state[first];
+        state[first] = state[second];
+        state[second] = temp;
+    }
+}
 
-        for (int i = 0; i < 4; i++) {
-            char move = moves[i];
-            if (current->parent && move == opposite_move(current->move)) {
-                continue;
-            }
-            int *next_state = malloc(sizeof(int) * (size_t)len);
-            if (!next_state) {
-                fprintf(stderr, "Failed to allocate state.\n");
-                exit(EXIT_FAILURE);
-            }
-            memcpy(next_state, current->state, sizeof(int) * (size_t)len);
-            int next_blank = current->blank_index;
-            if (!apply_move(next_state, n, &next_blank, move)) {
-                free(next_state);
-                continue;
-            }
+static bool generate_ini_file(const char *path, int n) {
+    if (n <= 1) {
+        fprintf(stderr, "Puzzle size must be greater than 1.\n");
+        return false;
+    }
+    int len = n * n;
+    int *state = malloc(sizeof(int) * (size_t)len);
+    if (!state) {
+        fprintf(stderr, "Failed to allocate puzzle state.\n");
+        return false;
+    }
+    for (int i = 0; i < len - 1; i++) {
+        state[i] = i;
+    }
+    state[len - 1] = -1;
 
-            int g = current->g + 1;
-            uint64_t hash = fnv1a_hash(next_state, len);
-            if (visited_should_skip(&visited, hash, next_state, len, g)) {
-                free(next_state);
-                continue;
-            }
+    srand((unsigned int)time(NULL));
+    for (int i = len - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        int temp = state[i];
+        state[i] = state[j];
+        state[j] = temp;
+    }
 
-            int h = manhattan_distance(next_state, n);
-            Node *child = create_node(next_state, len, next_blank, g, h, current, move);
-            free(next_state);
-            heap_push(&open_set, child);
-            visited_add(&visited, hash, child->state, len, g);
-            node_list_push(&nodes, child);
+    int blank_index = 0;
+    for (int i = 0; i < len; i++) {
+        if (state[i] == -1) {
+            blank_index = i;
+            break;
         }
     }
 
-    if (!goal_node) {
-        printf("No solution found.\n");
-        visited_free(&visited);
-        free(open_set.data);
-        node_list_free(&nodes);
+    make_solvable(state, n, &blank_index);
+
+    FILE *file = fopen(path, "w");
+    if (!file) {
+        fprintf(stderr, "Failed to write %s: %s\n", path, strerror(errno));
+        free(state);
+        return false;
+    }
+
+    fprintf(file, "%d\n", n);
+    for (int r = 0; r < n; r++) {
+        for (int c = 0; c < n; c++) {
+            if (c > 0) {
+                fprintf(file, ",");
+            }
+            fprintf(file, "%d", state[r * n + c]);
+        }
+        fprintf(file, "\n");
+    }
+
+    fclose(file);
+    free(state);
+    return true;
+}
+
+static int ida_search(SearchContext *ctx, int *state, int *blank_index, int g, int bound,
+                      char prev_move, char *path) {
+    int h = manhattan_distance(state, ctx->n);
+    int f = g + h;
+    if (f > bound) {
+        return f;
+    }
+    if (is_goal(state, ctx->len)) {
+        return -1;
+    }
+
+    ctx->expanded++;
+
+    int min = INT_MAX;
+    const char moves[4] = {'U', 'D', 'L', 'R'};
+    for (int i = 0; i < 4; i++) {
+        char move = moves[i];
+        if (prev_move && move == opposite_move(prev_move)) {
+            continue;
+        }
+        int prior_blank = *blank_index;
+        if (!apply_move(state, ctx->n, blank_index, move)) {
+            continue;
+        }
+
+        path[g] = move;
+        int result = ida_search(ctx, state, blank_index, g + 1, bound, move, path);
+        if (result == -1) {
+            return -1;
+        }
+        if (result < min) {
+            min = result;
+        }
+
+        apply_move(state, ctx->n, blank_index, opposite_move(move));
+        *blank_index = prior_blank;
+    }
+
+    return min;
+}
+
+static void solve_puzzle(int *state, int n, int blank_index) {
+    SearchContext ctx = {
+        .n = n,
+        .len = n * n,
+        .expanded = 0
+    };
+
+    int bound = manhattan_distance(state, n);
+    char *path = malloc(sizeof(char) * (size_t)MAX_ITERATION_BOUND);
+    if (!path) {
+        fprintf(stderr, "Failed to allocate solution path.\n");
         return;
     }
 
-    size_t move_count = 0;
-    char *solution_moves = reconstruct_moves(goal_node, &move_count);
-    printf("Shortest solution length: %zu moves\n", move_count);
-    printf("Tiles out of place: %d\n", count_misplaced(goal_node->state, len));
-    write_moves("move.txt", solution_moves, move_count);
-    free(solution_moves);
+    while (true) {
+        if (bound > MAX_ITERATION_BOUND) {
+            printf("Search bound exceeded %d. No solution found.\n", MAX_ITERATION_BOUND);
+            break;
+        }
+        int result = ida_search(&ctx, state, &blank_index, 0, bound, '\0', path);
+        if (result == -1) {
+            printf("Shortest solution length: %d moves\n", bound);
+            printf("Tiles out of place: %d\n", count_misplaced(state, ctx.len));
+            write_moves("move.txt", path, (size_t)bound);
+            break;
+        }
+        if (result == INT_MAX) {
+            printf("No solution found.\n");
+            break;
+        }
+        bound = result;
+    }
 
-    visited_free(&visited);
-    free(open_set.data);
-    node_list_free(&nodes);
+    printf("States expanded: %lld\n", ctx.expanded);
+    free(path);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc >= 3 && strcmp(argv[1], "generate") == 0) {
+        int n = atoi(argv[2]);
+        if (!generate_ini_file("ini.txt", n)) {
+            return EXIT_FAILURE;
+        }
+        printf("Generated ini.txt for %dx%d puzzle.\n", n, n);
+        return EXIT_SUCCESS;
+    }
+
     int *state = NULL;
     int n = 0;
     int blank_index = -1;
@@ -610,7 +479,7 @@ int main(void) {
         printf("Tiles out of place: %d\n", count_misplaced(state, n * n));
         free(moves);
     } else {
-        printf("move.txt empty or missing. Solving with A* search...\n");
+        printf("move.txt empty or missing. Solving with divide-and-conquer search (IDA*).\n");
         printf("Initial tiles out of place: %d\n", count_misplaced(state, n * n));
         solve_puzzle(state, n, blank_index);
     }
